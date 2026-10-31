@@ -42,12 +42,17 @@ def initialize_database():
         db.executescript("""
         CREATE TABLE IF NOT EXISTS rooms(code TEXT PRIMARY KEY,host_token TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN ('lobby','running','finished')),round_number INTEGER NOT NULL DEFAULT 0,duration_ms INTEGER NOT NULL,created_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS players(token TEXT PRIMARY KEY,room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,name TEXT NOT NULL,score REAL NOT NULL DEFAULT 0,joined_at REAL NOT NULL,last_seen REAL NOT NULL,is_host INTEGER NOT NULL DEFAULT 0,UNIQUE(room_code,name COLLATE NOCASE));
-        CREATE TABLE IF NOT EXISTS rounds(room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,number INTEGER NOT NULL,start_price REAL NOT NULL,started_at REAL NOT NULL,deadline REAL NOT NULL,actual REAL,resolved_at REAL,PRIMARY KEY(room_code,number));
+        CREATE TABLE IF NOT EXISTS rounds(room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,number INTEGER NOT NULL,start_price REAL NOT NULL,started_at REAL NOT NULL,deadline REAL NOT NULL,actual REAL,resolved_at REAL,intermission_until REAL,PRIMARY KEY(room_code,number));
         CREATE TABLE IF NOT EXISTS forecasts(room_code TEXT NOT NULL,round_number INTEGER NOT NULL,player_token TEXT NOT NULL REFERENCES players(token),prediction REAL NOT NULL,error_pct REAL,points REAL,submitted_at REAL NOT NULL,PRIMARY KEY(room_code,round_number,player_token),FOREIGN KEY(room_code,round_number) REFERENCES rounds(room_code,number));
         CREATE TABLE IF NOT EXISTS chat_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,room_code TEXT NOT NULL REFERENCES rooms(code) ON DELETE CASCADE,player_token TEXT NOT NULL REFERENCES players(token),name TEXT NOT NULL,body TEXT NOT NULL,created_at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_players_room ON players(room_code);
         CREATE INDEX IF NOT EXISTS idx_chat_room_id ON chat_messages(room_code,id);
         """)
+        try:
+            db.execute("ALTER TABLE rounds ADD COLUMN intermission_until REAL")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error).lower():
+                raise
 
 def market_price(force=False):
     now = time.monotonic()
@@ -89,11 +94,26 @@ def market_price(force=False):
         raise RuntimeError("BTC/USD price is temporarily unavailable") from last_error
 
 def resolve_if_due(code):
+    now = time.time()
     with DB_LOCK, database() as db:
         room = db.execute("SELECT * FROM rooms WHERE code=?",(code,)).fetchone()
         if room is None or room["status"] != "running": return
         current = db.execute("SELECT * FROM rounds WHERE room_code=? AND number=?",(code,room["round_number"])).fetchone()
-        if current is None or current["actual"] is not None or time.time() < current["deadline"]: return
+        if current is None: return
+        if current["actual"] is not None:
+            number = int(current["number"])
+            if number >= 20: return
+            intermission_until = current["intermission_until"]
+            if intermission_until is None:
+                db.execute("UPDATE rounds SET intermission_until=? WHERE room_code=? AND number=?",(now+20,code,number))
+                return
+            if now < intermission_until: return
+            next_number = number+1
+            actual = float(current["actual"])
+            db.execute("UPDATE rooms SET round_number=? WHERE code=?",(next_number,code))
+            db.execute("INSERT INTO rounds(room_code,number,start_price,started_at,deadline) VALUES(?,?,?,?,?)",(code,next_number,actual,now,now+room["duration_ms"]/1000.0))
+            return
+        if now < current["deadline"]: return
     try: actual = market_price(force=True)["price"]
     except RuntimeError: return
     now = time.time()
@@ -103,7 +123,8 @@ def resolve_if_due(code):
         number = int(room["round_number"])
         current = db.execute("SELECT * FROM rounds WHERE room_code=? AND number=?",(code,number)).fetchone()
         if current is None or current["actual"] is not None or now < current["deadline"]: return
-        db.execute("UPDATE rounds SET actual=?,resolved_at=? WHERE room_code=? AND number=?",(actual,now,code,number))
+        intermission_until = now+20 if number < 20 else None
+        db.execute("UPDATE rounds SET actual=?,resolved_at=?,intermission_until=? WHERE room_code=? AND number=?",(actual,now,intermission_until,code,number))
         forecasts = db.execute("SELECT player_token,prediction FROM forecasts WHERE room_code=? AND round_number=?",(code,number)).fetchall()
         for item in forecasts:
             error_pct = abs(float(item["prediction"])-actual)/actual*100
@@ -112,10 +133,6 @@ def resolve_if_due(code):
             db.execute("UPDATE players SET score=score+? WHERE token=?",(points,item["player_token"]))
         if number >= 20:
             db.execute("UPDATE rooms SET status='finished' WHERE code=?",(code,))
-        else:
-            next_number = number+1
-            db.execute("UPDATE rooms SET round_number=? WHERE code=?",(next_number,code))
-            db.execute("INSERT INTO rounds(room_code,number,start_price,started_at,deadline) VALUES(?,?,?,?,?)",(code,next_number,actual,now,now+room["duration_ms"]/1000.0))
 
 def clean_name(value):
     name = " ".join(str(value or "").split()).strip()
@@ -185,7 +202,11 @@ def room_snapshot(code,token):
             latest=completed[-1]
             rows=db.execute("SELECT p.name,f.prediction,f.points FROM forecasts f JOIN players p ON p.token=f.player_token WHERE f.room_code=? AND f.round_number=? ORDER BY f.points DESC,p.name COLLATE NOCASE",(code,latest["number"])).fetchall()
             reveal={"number":latest["number"],"actual":latest["actual"],"forecasts":[dict(name=r["name"],prediction=r["prediction"],points=r["points"]) for r in rows]}
-        return {"code":code,"status":room["status"],"round_number":room["round_number"],"duration_ms":room["duration_ms"],"is_host":bool(player["is_host"]),"player_name":player["name"],"players":[dict(name=p["name"],host=bool(p["is_host"]),online=now-p["last_seen"]<12) for p in players],"connected_count":online,"leaderboard":[dict(name=r["name"],score=round(r["score"],1),you=r["token"]==token) for r in leaders],"round":dict(number=current["number"],start_price=current["start_price"],seconds_left=max(0,math.ceil(current["deadline"]-now)),submitted=submitted,locked=locked) if current else None,"rounds_completed":len(completed),"reveal":reveal,"can_start":room["status"]=="lobby" and bool(player["is_host"]) and online>=2}
+        round_data=None
+        if current:
+            intermission=room["status"]=="running" and current["actual"] is not None and current["number"]<20
+            round_data={"number":current["number"],"phase":"intermission" if intermission else "forecast","start_price":current["start_price"],"actual":current["actual"],"seconds_left":0 if intermission else max(0,math.ceil(current["deadline"]-now)),"intermission_seconds_left":max(0,math.ceil((current["intermission_until"] or now)-now)) if intermission else 0,"submitted":submitted,"locked":locked}
+        return {"code":code,"status":room["status"],"round_number":room["round_number"],"duration_ms":room["duration_ms"],"is_host":bool(player["is_host"]),"player_name":player["name"],"players":[dict(name=p["name"],host=bool(p["is_host"]),online=now-p["last_seen"]<12) for p in players],"connected_count":online,"leaderboard":[dict(name=r["name"],score=round(r["score"],1),you=r["token"]==token) for r in leaders],"round":round_data,"rounds_completed":len(completed),"reveal":reveal,"can_start":room["status"]=="lobby" and bool(player["is_host"]) and online>=2}
 
 class Handler(SimpleHTTPRequestHandler):
     server_version="TickerTussle/2.0"
