@@ -22,14 +22,14 @@ The included free service is suitable for a demo, with limits: it can sleep afte
 5. At the deadline, confirm both players see the same actual BTC/USD quote, the revealed forecasts, and the updated shared leaderboard.
 6. Send chat messages from each device and confirm they appear only in that room. Try a second room to confirm rooms are separate.
 7. Try the 30-second, 1-minute, and 2-minute settings in separate new rooms. Check a phone-sized screen and refresh a joined browser to confirm it rejoins the same player session.
-8. If something fails, check the Render service logs and `/api/health`; for a market quote problem, retry after CoinGecko responds.
+8. If something fails, check the Render service logs and `/api/health`. Check `/api/price` for the active quote source; the server tries Coinbase first and CoinGecko if Coinbase is unavailable.
 
 ## Current rules
 
 - Up to 12 players join a six-character room code. The host needs at least one other connected player to start.
 - The host chooses a 30-second, 1-minute, or 2-minute timer before the match. It stays fixed for all 20 rounds.
 - The server stores each player's forecast privately and accepts one call per round before its deadline.
-- At the deadline, the server fetches the CoinGecko BTC/USD spot quote and uses that same actual value for all submitted forecasts.
+- At the deadline, the server fetches one BTC/USD spot quote (Coinbase first, CoinGecko fallback) and uses that same actual value for all submitted forecasts.
 - Score: `max(0, 100 - 20 × absolute percentage error)` per round. A player who misses a round receives no points for that round.
 - Room chat, player roster, timer, reveals, and cumulative leaderboard are shared only within that room.
 
