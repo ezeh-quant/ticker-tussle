@@ -11,8 +11,8 @@ ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("ARENA_DB_PATH", ROOT / "ticker-tussle.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 PRICE_SOURCES = (
-    ("Coinbase", "https://api.exchange.coinbase.com/products/BTC-USD/ticker", lambda payload: payload["price"]),
-    ("CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", lambda payload: payload["bitcoin"]["usd"]),
+    ("Coinbase", "https://api.exchange.coinbase.com/products/BTC-USD/ticker", "coinbase"),
+    ("CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true", "coingecko"),
 )
 DURATIONS = {30_000, 60_000, 120_000}
 MAX_PLAYERS = 12
@@ -57,15 +57,29 @@ def market_price(force=False):
         if not force and now < PRICE_CACHE["error_until"]:
             raise RuntimeError("BTC/USD price is temporarily unavailable")
         last_error = None
-        for source, upstream, extract_price in PRICE_SOURCES:
-            request = Request(upstream, headers={"Accept":"application/json","User-Agent":"TickerTussle/1.0"})
+        for source, upstream, provider in PRICE_SOURCES:
             try:
-                with urlopen(request, timeout=4) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                price = float(extract_price(payload))
+                def fetch_json(url):
+                    request = Request(url, headers={"Accept":"application/json","User-Agent":"TickerTussle/1.0"})
+                    with urlopen(request, timeout=4) as response:
+                        return json.loads(response.read().decode("utf-8"))
+                payload = fetch_json(upstream)
+                if provider == "coinbase":
+                    stats = fetch_json("https://api.exchange.coinbase.com/products/BTC-USD/stats")
+                    price = float(payload["price"])
+                    open_24h = float(stats["open"])
+                    if not math.isfinite(open_24h) or open_24h <= 0:
+                        raise ValueError("Invalid BTC/USD 24-hour open")
+                    change_24h_pct = (price / open_24h - 1.0) * 100.0
+                else:
+                    price = float(payload["bitcoin"]["usd"])
+                    raw_change = payload["bitcoin"].get("usd_24h_change")
+                    change_24h_pct = float(raw_change) if raw_change is not None else None
                 if not math.isfinite(price) or price <= 0:
                     raise ValueError("Invalid BTC/USD quote")
-                body = {"price":price,"source":source,"as_of":time.time()}
+                if change_24h_pct is not None and not math.isfinite(change_24h_pct):
+                    change_24h_pct = None
+                body = {"price":price,"source":source,"change_24h_pct":change_24h_pct,"as_of":time.time()}
                 PRICE_CACHE.update(body=body,until=now+15,error_until=0)
                 return body
             except (HTTPError,URLError,TimeoutError,OSError,ValueError,KeyError,TypeError,UnicodeDecodeError) as error:
@@ -201,7 +215,7 @@ class Handler(SimpleHTTPRequestHandler):
             if path=="/api/health": return self.json_response(200,{"ok":True,"service":"ticker-tussle"})
             if path=="/api/price":
                 try:
-                    quote=market_price(); return self.json_response(200,{"bitcoin":{"usd":quote["price"]},"source":quote["source"],"as_of":quote["as_of"]})
+                    quote=market_price(); return self.json_response(200,{"bitcoin":{"usd":quote["price"]},"source":quote["source"],"change_24h_pct":quote["change_24h_pct"],"as_of":quote["as_of"]})
                 except RuntimeError as error: return self.json_response(502,{"error":str(error)})
             if path=="/api/room":
                 query=parse_qs(urlsplit(self.path).query); code=normalize_code(query.get("code",[""])[0]); player=authenticated_player(self,code)
