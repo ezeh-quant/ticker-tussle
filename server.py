@@ -210,7 +210,9 @@ class Handler(SimpleHTTPRequestHandler):
         path=urlsplit(self.path).path
         try:
             if path in ("/","/index.html","/btc-usd-live.html"):
-                self.path="/index.html"+urlsplit(self.path).query
+                # Serve the app shell for both the root page and invite URLs.
+                # The browser keeps its original query string for JavaScript to read.
+                self.path="/index.html"
                 return super().do_GET()
             if path=="/api/health": return self.json_response(200,{"ok":True,"service":"ticker-tussle"})
             if path=="/api/price":
