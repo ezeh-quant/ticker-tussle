@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ticker-tussle-forecast-arena
+    runtime: python
+    plan: free
+    buildCommand: python --version
+    startCommand: python outputs/server.py
+    healthCheckPath: /api/health
+    envVars:
+      - key: ARENA_DB_PATH
+        value: /tmp/ticker-tussle.sqlite3
