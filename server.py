@@ -10,7 +10,10 @@ import json, math, os, re, secrets, sqlite3, threading, time
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("ARENA_DB_PATH", ROOT / "ticker-tussle.sqlite3"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-UPSTREAM = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+PRICE_SOURCES = (
+    ("Coinbase", "https://api.exchange.coinbase.com/products/BTC-USD/ticker", lambda payload: payload["price"]),
+    ("CoinGecko", "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", lambda payload: payload["bitcoin"]["usd"]),
+)
 DURATIONS = {30_000, 60_000, 120_000}
 MAX_PLAYERS = 12
 ROOM_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
@@ -51,21 +54,25 @@ def market_price(force=False):
     with PRICE_LOCK:
         if not force and PRICE_CACHE["body"] is not None and now < PRICE_CACHE["until"]:
             return PRICE_CACHE["body"]
-        if now < PRICE_CACHE["error_until"]:
+        if not force and now < PRICE_CACHE["error_until"]:
             raise RuntimeError("BTC/USD price is temporarily unavailable")
-        request = Request(UPSTREAM, headers={"Accept":"application/json","User-Agent":"TickerTussle/1.0"})
-        try:
-            with urlopen(request, timeout=8) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            price = float(payload["bitcoin"]["usd"])
-            if not math.isfinite(price) or price <= 0:
-                raise ValueError("Invalid BTC/USD quote")
-            body = {"price":price,"source":"CoinGecko","as_of":time.time()}
-            PRICE_CACHE.update(body=body,until=now+15,error_until=0)
-            return body
-        except (HTTPError,URLError,TimeoutError,ValueError,KeyError,TypeError,json.JSONDecodeError) as error:
-            PRICE_CACHE.update(error_until=now+5)
-            raise RuntimeError("BTC/USD price is temporarily unavailable") from error
+        last_error = None
+        for source, upstream, extract_price in PRICE_SOURCES:
+            request = Request(upstream, headers={"Accept":"application/json","User-Agent":"TickerTussle/1.0"})
+            try:
+                with urlopen(request, timeout=4) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                price = float(extract_price(payload))
+                if not math.isfinite(price) or price <= 0:
+                    raise ValueError("Invalid BTC/USD quote")
+                body = {"price":price,"source":source,"as_of":time.time()}
+                PRICE_CACHE.update(body=body,until=now+15,error_until=0)
+                return body
+            except (HTTPError,URLError,TimeoutError,OSError,ValueError,KeyError,TypeError,UnicodeDecodeError) as error:
+                last_error = error
+                print(f"BTC/USD provider unavailable: {source} ({type(error).__name__})")
+        PRICE_CACHE.update(error_until=now+5)
+        raise RuntimeError("BTC/USD price is temporarily unavailable") from last_error
 
 def resolve_if_due(code):
     with DB_LOCK, database() as db:
@@ -194,7 +201,7 @@ class Handler(SimpleHTTPRequestHandler):
             if path=="/api/health": return self.json_response(200,{"ok":True,"service":"ticker-tussle"})
             if path=="/api/price":
                 try:
-                    quote=market_price(); return self.json_response(200,{"bitcoin":{"usd":quote["price"]},"source":"CoinGecko","as_of":quote["as_of"]})
+                    quote=market_price(); return self.json_response(200,{"bitcoin":{"usd":quote["price"]},"source":quote["source"],"as_of":quote["as_of"]})
                 except RuntimeError as error: return self.json_response(502,{"error":str(error)})
             if path=="/api/room":
                 query=parse_qs(urlsplit(self.path).query); code=normalize_code(query.get("code",[""])[0]); player=authenticated_player(self,code)
