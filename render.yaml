@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: python --version
-    startCommand: python outputs/server.py
+    startCommand: python server.py
     healthCheckPath: /api/health
     envVars:
       - key: ARENA_DB_PATH
